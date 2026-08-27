@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wineole"
+version = "0.1.0"
+description = "Drive Win32OLE/COM automation of Wine-hosted Windows apps from Python"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/firelzrd/wineole"
+Repository = "https://github.com/firelzrd/wineole"
+Issues = "https://github.com/firelzrd/wineole/issues"
+
+[tool.setuptools.package-data]
+wineole = ["dist/**/*"]
