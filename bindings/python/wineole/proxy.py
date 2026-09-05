@@ -1,19 +1,25 @@
 import datetime
 
 from .errors import NotSerializableError, StaleReferenceError
+# Stated here rather than left to __init__.py: `ole_events` below names the
+# class, so anything that imports this module alone -- tests/test_proxy.py
+# does -- must get a working property rather than a NameError the first time
+# it is used. events.py imports Proxy at call time, not import time, so there
+# is no cycle.
+from .events import Events
 
 
 class Member:
     """A bound-but-not-yet-invoked member access, returned by `Proxy.__getattr__`.
 
     Python's attribute access (`proxy.Foo`) and a subsequent call (`(...)`)
-    are two separate language-level operations — unlike Ruby's
+    are two separate language-level operations -- unlike Ruby's
     `method_missing`, which treats them identically. Returning this wrapper
     from `__getattr__`, rather than performing the RPC immediately, keeps
     `proxy.Worksheets()` (property-get, zero args) and
     `proxy.Worksheets().Add(After=sheet)` (method call with a real Python
     keyword argument, mapping straight onto the wire's `named` dict)
-    unambiguous — at the cost of always needing the trailing `()`, even for
+    unambiguous -- at the cost of always needing the trailing `()`, even for
     pure properties.
     """
 
@@ -29,19 +35,60 @@ class Member:
 
 class Proxy:
     @classmethod
-    def create(cls, class_name, client):
-        handle = client.call('create', {'class_name': class_name})['$ole_ref']
+    def create(cls, class_name, client, cleanup=None):
+        params = {'class_name': class_name}
+        if cleanup is not None:
+            params['cleanup'] = cls._build_cleanup(cleanup)
+        handle = client.call('create', params)['$ole_ref']
+        cls._register_cleanup(client, handle, cleanup)
         return cls(client, session_id=client.generation, handle=handle, created=True)
 
     @classmethod
-    def connect(cls, class_name, client):
-        handle = client.call('connect', {'class_name': class_name})['$ole_ref']
+    def connect(cls, class_name, client, cleanup=None):
+        params = {'class_name': class_name}
+        if cleanup is not None:
+            params['cleanup'] = cls._build_cleanup(cleanup)
+        handle = client.call('connect', params)['$ole_ref']
+        cls._register_cleanup(client, handle, cleanup)
         return cls(client, session_id=client.generation, handle=handle, created=False)
 
     @classmethod
-    def connect_or_create(cls, class_name, client):
-        result = client.call('connect_or_create', {'class_name': class_name})
-        return cls(client, session_id=client.generation, handle=result['$ole_ref'], created=result['created'])
+    def connect_or_create(cls, class_name, client, cleanup=None):
+        params = {'class_name': class_name}
+        if cleanup is not None:
+            params['cleanup'] = cls._build_cleanup(cleanup)
+        result = client.call('connect_or_create', params)
+        handle = result['$ole_ref']
+        cls._register_cleanup(client, handle, cleanup)
+        return cls(client, session_id=client.generation, handle=handle, created=result['created'])
+
+    @staticmethod
+    def _build_cleanup(cleanup):
+        # `cleanup` is {'steps': [[name, *args], ...], 'on_cleanup': callable
+        # or absent}; the wire wants {'steps': [{'name':, 'args':}, ...],
+        # 'callback': bool}. `callback` tells the bridge whether to hold the
+        # root open and emit a $cleanup event for a registered closure, or
+        # just run the steps and release outright -- so its value comes from
+        # whether on_cleanup is present, not from anything the caller states
+        # separately. The closure itself never goes on the wire.
+        on_cleanup = cleanup.get('on_cleanup')
+        if on_cleanup is not None and not callable(on_cleanup):
+            raise TypeError('cleanup on_cleanup must be callable, or absent')
+        steps = [{'name': step[0], 'args': list(step[1:])} for step in cleanup.get('steps', [])]
+        return {'steps': steps, 'callback': on_cleanup is not None}
+
+    @staticmethod
+    def _register_cleanup(client, handle, cleanup):
+        # Register the client closure (if any) so the dispatcher can deliver
+        # $cleanup for this root handle. Only reached when the caller asked
+        # for one, so a client that never uses on_cleanup never touches the
+        # dispatcher here.
+        if not cleanup:
+            return
+        on_cleanup = cleanup.get('on_cleanup')
+        if on_cleanup is None:
+            return
+        client.dispatcher.register_cleanup(handle, on_cleanup)
 
     @classmethod
     def wrap(cls, client, session_id, ole_ref):
@@ -52,6 +99,11 @@ class Proxy:
         self._session_id = session_id
         self._handle = handle
         self._created = created
+        # Set here, and not merely left to the property below, because
+        # __getattr__ answers any name it does not find with a Member: an
+        # unset _ole_events would come back as a callable COM member stand-in
+        # rather than as "not memoised yet".
+        self._ole_events = None
 
     @property
     def ole_handle(self):
@@ -67,19 +119,35 @@ class Proxy:
         fallback, or attached to something already running? True for
         .create, False for .connect, whatever the bridge reported for
         .connect_or_create, and None for anything derived from another
-        Proxy (e.g. xl.Worksheets()) — attach-vs-create isn't a meaningful
+        Proxy (e.g. xl.Worksheets()) -- attach-vs-create isn't a meaningful
         question for those."""
         return self._created
+
+    @property
+    def ole_events(self):
+        """COM events for this object. Named with the ole_ prefix like every
+        other bookkeeping member here: a Proxy forwards unknown names straight
+        to COM, so a bare `events` would shadow a real Events member.
+
+        A property, so it is found on the class before __getattr__ is
+        consulted and never reaches COM. Memoised, because the Events owns a
+        place on the connection dispatcher and a bridge-side subscription set:
+        a fresh one per access would mean `on` and the `off` that is meant to
+        undo it talked to different objects."""
+        self._check_live()
+        if self._ole_events is None:
+            self._ole_events = Events(self._client, self._handle, self)
+        return self._ole_events
 
     def __getattr__(self, name):
         # Only reached for names not already found by normal attribute
         # lookup (i.e. never for _client/_handle/_session_id/_created, which
         # __init__ sets via the real __dict__, nor for the ole_* properties
-        # above) — everything else is assumed to be a COM member name and
+        # above) -- everything else is assumed to be a COM member name and
         # gets deferred into a Member.
         #
         # Dunders are the exception. CPython looks up *most* special methods
-        # on the type, bypassing __getattr__ entirely — which is why this
+        # on the type, bypassing __getattr__ entirely -- which is why this
         # class needs no Ruby-style implicit-conversion guard list. But some
         # stdlib protocols probe the *instance*: copy.deepcopy() does a
         # plain getattr(obj, '__deepcopy__', None). Answering those with a
@@ -115,7 +183,26 @@ class Proxy:
         return self._client.call('const_load', {'handle': self._handle})
 
     def ole_release(self):
-        return self._client.call('release', {'handle': self._handle})
+        result = self._client.call('release', {'handle': self._handle})
+        # A client closure must run before this handle is actually gone: the
+        # bridge answers with the $cleanup sequence number instead of
+        # releasing outright, and this blocks until the dispatcher has
+        # delivered it and the release_event that follows. See
+        # Client.await_cleanup.
+        if isinstance(result, dict):
+            seq = result.get('cleanup')
+            if seq is not None:
+                self._client.await_cleanup(seq)
+        return None
+
+    def ole_leave_open(self):
+        # Revokes the bridge's permission to run this instance's declared
+        # cleanup steps when its last user releases the root -- the
+        # instance (e.g. an auto-created Excel) then outlives this
+        # connection instead of being torn down. Matches proxy.rb's
+        # ole_leave_open.
+        self._client.call('leave_open', {'handle': self._handle})
+        return None
 
     def __reduce__(self):
         raise NotSerializableError(
@@ -155,15 +242,56 @@ class Proxy:
                     'passed as an argument here'
                 )
             return {'$ole_ref': value.ole_handle}
+        if isinstance(value, datetime.datetime):
+            # The same tag the receive side emits for VT_DATE. The wall clock
+            # goes as-is: a VT_DATE carries no timezone, so converting here
+            # would silently move the value the caller wrote.
+            #
+            # datetime is checked before date because datetime is a *subclass*
+            # of date. Kept in this order deliberately: today both branches
+            # format the same object with the same call, so the order is not
+            # load-bearing (there is nothing observable to test). It is
+            # defence against the future -- any date-specific formatting
+            # added to the `date` branch below would silently truncate every
+            # datetime without this order. Matching wineole/proxy.rb's
+            # `encode`.
+            return {'$type': 'time', 'iso8601': value.strftime('%Y-%m-%dT%H:%M:%S')}
+        if isinstance(value, datetime.date):
+            # A bare date, with no time component. It becomes midnight;
+            # datetime was already handled above. Matching wineole/proxy.rb's
+            # `encode`.
+            return {'$type': 'time', 'iso8601': value.strftime('%Y-%m-%dT%H:%M:%S')}
         if isinstance(value, dict):
             return {k: self._encode(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self._encode(v) for v in value]
         return value
 
-    def _decode(self, value):
-        if isinstance(value, dict) and '$ole_ref' in value:
-            return Proxy.wrap(self._client, self._client.generation, value['$ole_ref'])
-        if isinstance(value, dict) and value.get('$type') == 'time':
-            return datetime.datetime.fromisoformat(value['iso8601'])
+    @classmethod
+    def decode(cls, client, value):
+        """One wire value, in Python terms.
+
+        On the class rather than private to an instance because two different
+        holders of a client need it: an invoke's RESULT, and an event's
+        ARGUMENTS (Events._build_args). A second copy of this walk over there
+        is how the same tagged value ends up a datetime when a call returns it
+        and a raw {'$type': 'time'} dict when an event carries it -- and how a
+        nested $ole_ref reaches a callback unwrapped.
+
+        Recursive, mirroring proxy.rb's decode: a bulk range read comes back
+        as a list of rows, and the values needing conversion sit inside it,
+        not at the top level. A non-recursive decode would hand back raw
+        {'$type': 'time'} dicts for every date cell in the range.
+        """
+        if isinstance(value, list):
+            return [cls.decode(client, v) for v in value]
+        if isinstance(value, dict):
+            if '$ole_ref' in value:
+                return cls.wrap(client, client.generation, value['$ole_ref'])
+            if value.get('$type') == 'time':
+                return datetime.datetime.fromisoformat(value['iso8601'])
+            return {k: cls.decode(client, v) for k, v in value.items()}
         return value
+
+    def _decode(self, value):
+        return Proxy.decode(self._client, value)

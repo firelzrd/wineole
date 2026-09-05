@@ -9,7 +9,7 @@ use windows::Win32::System::Ole::GetActiveObject;
 use windows::Win32::Foundation::E_FAIL;
 use windows::core::VARIANT;
 
-const LOCALE_USER_DEFAULT: u32 = 0x0400;
+pub(crate) const LOCALE_USER_DEFAULT: u32 = 0x0400;
 const DISPID_PROPERTYPUT: i32 = -3;
 const DISPID_VALUE: i32 = 0;
 
@@ -89,6 +89,22 @@ fn raw_invoke(
     mut positional: Vec<VARIANT>,
     named: Vec<(i32, VARIANT)>,
 ) -> ComResult<VARIANT> {
+    // OUTBOUND arguments are reversed; INBOUND ones, in sink.rs's `Invoke`,
+    // are not. That looks like the project holding two opposite beliefs, so:
+    // both are measured, and they are a pair rather than a contradiction.
+    //
+    // Out: DISPPARAMS::rgvarg is documented last-to-first, and Excel's own
+    // Invoke reads it that way. Measured against a live Excel by
+    // `test_positional_arguments_reach_excel_in_order` below -- Cells(2, 3)
+    // must be $C$2, and without this line it is $B$3.
+    //
+    // In: the callback does not come from a caller like this one at all, it
+    // comes out of Wine's RPC stub -- and measured, that stub sends every
+    // event argument as a NAMED one, identified by its parameter position
+    // (SheetChange arrives with cArgs=2, cNamedArgs=2, rgdispidNamedArgs=[0,
+    // 1]). So no positional reversal applies to it, and `sink::ordered_args`
+    // -- which is this function read backwards, and says so -- places those
+    // arguments by the positions their DISPIDs name.
     positional.reverse();
     let mut rgvarg: Vec<VARIANT> = Vec::new();
     let mut rgdispid_named: Vec<i32> = Vec::new();
@@ -341,6 +357,125 @@ unsafe fn read_enum_constant(ti: &ITypeInfo, vardesc: *mut VARDESC) -> Option<(S
     Some((name, value))
 }
 
+/// Serialises every test in this crate that creates or connects to
+/// `Excel.Application` — they live in `dispatch`, `session`, `server` and
+/// `sink`, which is why this sits at module scope rather than inside
+/// `mod tests` where its Word counterpart (`WORD_ROT_LOCK`) lives.
+///
+/// **This is a symptomatic fix. The cause is not understood.** Read the
+/// whole of this comment before changing anything here.
+///
+/// ## What is observed
+///
+/// `cargo test` runs the whole suite as concurrent threads in one process.
+/// Past some concurrency threshold, `create_instance("Excel.Application")`
+/// starts failing with `E_NOINTERFACE` (0x80004002) while Wine logs
+///
+/// ```text
+/// err:ole:com_get_class_object no class object
+///   {00024500-0000-0000-c000-000000000046} could be created for context 0x4
+/// ```
+///
+/// (that CLSID is `Excel.Application`; context 0x4 is `CLSCTX_LOCAL_SERVER`).
+/// Measured, `cargo test --target x86_64-pc-windows-gnu`:
+///
+/// | tree | result |
+/// | --- | --- |
+/// | this suite, parallel | 64 passed / 2 failed — twice, the same two |
+/// | the suite as it stood before this fix, untouched, parallel | 64 passed / 1 failed — already failing |
+/// | that same earlier suite plus ONE trivial extra Excel test (create, `Quit`, done — no sink, no events) | 64 passed / **2** failed — the same two |
+/// | `--test-threads=1` | 66 passed / 0 failed — twice |
+///
+/// The third row is the load-bearing measurement. A test that does nothing
+/// but create Excel and quit it moved the failure count from one to two, and
+/// the tests that broke were not the new one. So the trigger is *how many
+/// tests drive Excel at once*, not what any individual test does — which is
+/// why the lock is taken by all of them and not just by the two that happen
+/// to fail today.
+///
+/// ## What the cause is not
+///
+/// Four hypotheses were measured, and **all four are disproven**. They are
+/// recorded here so the next person does not spend another afternoon
+/// re-measuring them:
+///
+/// 1. *"The tests share one Excel instance, and one test's cleanup breaks
+///    another's."* No. `CoCreateInstance("Excel.Application")` spawns a
+///    **new** EXCEL.EXE every time; measured 1 → 2 → 3 → 4 live processes on
+///    successive creates.
+/// 2. *"`Quit` bypasses COM refcounting and kills other clients'
+///    references."* No. With client A and client B both holding references,
+///    `A.Quit` leaves the process alive and B fully usable.
+/// 3. *"There is a limit of about three concurrent Excel processes."* No.
+///    Eight simultaneous creates from eight threads all succeeded.
+/// 4. *"A create fails when it races another Excel's teardown."* No. Twelve
+///    rounds of create-racing-a-`Quit`: twelve successes.
+///
+/// Hypothesis 4 is why this lock does **not** carry a
+/// `wait_for_excel_gone_from_rot` counterpart to the Word lock's drain: a
+/// create racing a teardown was measured not to fail, and the five green
+/// full-suite runs that shipped this change agree (`pgrep -cf 'EXCE[L].EXE'`
+/// settled at 0 after every one of them). `WORD_ROT_LOCK` needs its
+/// drain for a different and *understood* reason — a Word test asserts that
+/// nothing matching `Word.Application` is running, which is only true once
+/// WINWORD.EXE has actually left the Running Object Table. No Excel test
+/// asserts the absence of Excel, so there is no equivalent invariant to
+/// uphold here. If the failure ever returns, adding that drain is the first
+/// thing to try.
+///
+/// ## Deliberately separate from `WORD_ROT_LOCK`
+///
+/// Two locks, not one, decided on the measurement rather than on taste. The
+/// question is whether Word and Publisher tests running concurrently with
+/// Excel tests can also trigger this: with the two locks kept separate they
+/// do exactly that on every run, and five consecutive suites came back green
+/// against a baseline that failed the same way every time. So they do not
+/// interfere, and one lock would be buying nothing.
+///
+/// They are also answers to different questions. `WORD_ROT_LOCK` upholds a
+/// specific, understood invariant (a Word test asserts nothing matching
+/// `Word.Application` is running) and is paired with a Word-specific ROT
+/// drain; this one suppresses an unexplained creation failure and has no
+/// drain. Folding them together would put three more tests on this chain,
+/// and would leave the Word lock's carefully-argued doc comment describing
+/// only half of what it guards. If Excel ever *does* start failing while
+/// only a Word or Publisher test is in flight, merging them is the obvious
+/// next move — the evidence just does not point there today.
+///
+/// ## Not `--test-threads=1`
+///
+/// Serialising the *whole* suite is forbidden here in writing
+/// (`.superpowers/sdd/task-1.5-brief.md`): the tests that do not touch
+/// Office are meant to keep running in parallel, and a previous attempt at
+/// `--test-threads=1` (`5ed1c24`) was reverted for that reason (`b3e522e`).
+/// Only the Office-driving tests take a lock; everything else still runs in
+/// parallel. Measured on the development host: green in 18.9–19.1s with this
+/// lock, against 22.8s for the same suite under `--test-threads=1`. (The
+/// *failing* parallel baseline took 30.5s — this fix is not a slowdown; a
+/// pile-up of Excel launches that ends in `E_NOINTERFACE` costs more than
+/// starting them one at a time.)
+#[cfg(test)]
+static EXCEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`EXCEL_TEST_LOCK`] for the rest of the caller's scope. Every test
+/// that creates or connects to `Excel.Application` must open with
+///
+/// ```ignore
+/// let _guard = crate::dispatch::lock_excel_for_test();
+/// ```
+///
+/// — bound to a named `_guard`, never to a bare `_`, which would drop the
+/// guard immediately and serialise nothing.
+///
+/// Recovering a poisoned lock (rather than unwrapping) is deliberate: one
+/// panicking Excel test must not cascade into a failure in every other Excel
+/// test, which would bury the real one in noise. The mutex guards no data,
+/// so there is no invariant a panic could have left broken.
+#[cfg(test)]
+pub(crate) fn lock_excel_for_test() -> std::sync::MutexGuard<'static, ()> {
+    EXCEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,10 +493,97 @@ mod tests {
     // lock, letting the other fail loudly (rather than silently racing) is
     // the correct outcome, so recovering the guts of a poisoned lock is
     // intentional.
+    //
+    // The lock alone is NOT sufficient, though: it only serializes the two
+    // tests' *execution*, not Word's actual removal from the Running Object
+    // Table. `Quit` is asynchronous -- WINWORD.EXE is still alive (and still
+    // registered in the ROT) at the moment `invoke_member(&word, "Quit",
+    // ...)` returns, and the creating test's own `word: IDispatch` handle
+    // keeps a reference to it alive until it is dropped. If the lock is
+    // released before Word has actually finished exiting, the "nothing is
+    // running" test can acquire the lock, call `get_active_object`, and find
+    // Word still there -- an intermittent, scheduling-dependent failure.
+    // `wait_for_word_gone_from_rot` below closes that gap by polling
+    // `get_active_object` until it genuinely fails, before the lock guard is
+    // dropped.
+    //
+    // This lock covers Word only. The suite's Excel-driving tests are
+    // serialized separately, by `super::EXCEL_TEST_LOCK` / the
+    // `super::lock_excel_for_test()` helper at module scope above, for an
+    // unrelated and (unlike this one) *unexplained* reason. See that
+    // static's doc comment for why the two are kept apart.
     static WORD_ROT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `HRESULT_FROM_WIN32(RPC_S_CALL_FAILED)`. The `windows` crate has no
+    /// named constant for this one. Empirically, under Wine, the first poll
+    /// of `GetActiveObject("Word.Application")` immediately after `Quit` +
+    /// dropping the last live handle reliably returns this -- Word's RPC
+    /// endpoint is in the middle of being torn down -- and then the very
+    /// next poll (50ms later) returns `MK_E_UNAVAILABLE` as expected. It is
+    /// a transient of normal shutdown, not a genuine failure; do not
+    /// "simplify" this back into the general error arm below, or
+    /// `wait_for_word_gone_from_rot` will fail deterministically on every
+    /// run under Wine.
+    const RPC_CALL_FAILED: windows::core::HRESULT = windows::core::HRESULT(0x800706BE_u32 as _);
+
+    /// Poll `get_active_object("Word.Application")` until it stops finding an
+    /// instance (i.e. until Word has actually left the ROT), rather than
+    /// trusting that a call to `Quit` has taken effect by the time it returns.
+    ///
+    /// Panics if Word is still visible after `timeout`, so a real regression
+    /// here fails loudly and immediately instead of silently destabilizing
+    /// whichever test happens to run next. Also panics immediately -- without
+    /// waiting out the timeout -- on any error other than `MK_E_UNAVAILABLE`
+    /// or the `RPC_CALL_FAILED` shutdown transient, since no amount of
+    /// waiting will fix a genuine COM failure and misreporting it as "Word
+    /// was still visible" would send a future debugger chasing a race that
+    /// never happened.
+    fn wait_for_word_gone_from_rot(timeout: std::time::Duration, poll_interval: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let last_observation = match get_active_object("Word.Application") {
+                Err(e) if e.code == windows::Win32::Foundation::MK_E_UNAVAILABLE => return,
+                Err(e) if e.code == RPC_CALL_FAILED => {
+                    // Word's RPC endpoint tearing down mid-shutdown -- treat
+                    // exactly like "still registered" and keep polling.
+                    format!(
+                        "GetActiveObject returned RPC_S_CALL_FAILED (0x800706BE) -- \
+                         Word's RPC endpoint is tearing down: {:?}",
+                        e
+                    )
+                }
+                Err(e) => {
+                    // Anything else is a genuine, unexpected COM failure --
+                    // waiting cannot fix it, so fail fast with the real
+                    // error instead of spinning for the full timeout and
+                    // then blaming a race that never occurred.
+                    panic!(
+                        "unexpected error from GetActiveObject while polling for Word to exit: {:?}",
+                        e
+                    );
+                }
+                Ok(_) => "GetActiveObject still returned a live Word.Application instance".to_string(),
+            };
+
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "Word.Application never left the Running Object Table after Quit \
+                     (timeout {:?}); last observation: {}",
+                    timeout, last_observation
+                );
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
 
     #[test]
     fn test_full_round_trip_against_real_excel() {
+        // Held for the whole test -- see EXCEL_TEST_LOCK's doc comment.
+        // This test additionally *needs* to be the only Excel client running:
+        // its `get_active_object("Excel.Application")` below would otherwise
+        // be free to attach to some other test's instance.
+        let _guard = lock_excel_for_test();
+
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
         }
@@ -413,6 +635,9 @@ mod tests {
 
     #[test]
     fn test_com_errors_carry_a_usable_message() {
+        // Held for the whole test -- see EXCEL_TEST_LOCK's doc comment.
+        let _guard = lock_excel_for_test();
+
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
         }
@@ -481,6 +706,9 @@ mod tests {
 
     #[test]
     fn test_const_load_returns_real_excel_constants() {
+        // Held for the whole test -- see EXCEL_TEST_LOCK's doc comment.
+        let _guard = lock_excel_for_test();
+
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
         }
@@ -535,6 +763,17 @@ mod tests {
 
         invoke_member(&word, "Quit", vec![], vec![]).expect("Quit");
 
+        // `word` itself is a live reference to the Word.Application COM
+        // object; as long as it is held, Word cannot finish exiting. Drop it
+        // before polling, and poll (rather than assuming `Quit` has already
+        // taken effect) since `Quit` is asynchronous -- see WORD_ROT_LOCK's
+        // doc comment above.
+        drop(word);
+        wait_for_word_gone_from_rot(
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(50),
+        );
+
         unsafe {
             CoUninitialize();
         }
@@ -575,6 +814,197 @@ mod tests {
         }
     }
 
+    /// The unit round trip in value.rs cannot catch a consistently swapped
+    /// dimension order -- writing and reading with the same wrong convention
+    /// round trips fine. Excel is the arbiter: after writing a 2x3 array to
+    /// A1:C2, cell B1 must be the first row's second element.
+    #[test]
+    fn test_two_dimensional_array_lands_in_excel_row_major() {
+        // Held for the whole test -- see EXCEL_TEST_LOCK's doc comment.
+        let _guard = lock_excel_for_test();
+
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+        }
+
+        let xl = create_instance("Excel.Application").expect("CreateObject(Excel.Application)");
+        invoke_member(&xl, "Visible=", vec![VARIANT::from(false)], vec![]).expect("Visible=false");
+        invoke_member(&xl, "DisplayAlerts=", vec![VARIANT::from(false)], vec![])
+            .expect("DisplayAlerts=false");
+
+        let workbooks_v = invoke_member(&xl, "Workbooks", vec![], vec![]).expect("Workbooks");
+        let workbooks = dispatch_from_variant(&workbooks_v);
+        invoke_member(&workbooks, "Add", vec![], vec![]).expect("Workbooks.Add");
+
+        let sheets_v = invoke_member(&xl, "Worksheets", vec![], vec![]).expect("Worksheets");
+        let sheets = dispatch_from_variant(&sheets_v);
+        let sheet_v = invoke_member(&sheets, "", vec![VARIANT::from(1i32)], vec![]).expect("Worksheets(1)");
+        let sheet = dispatch_from_variant(&sheet_v);
+
+        // 2 rows x 3 cols. Values encode their own position so a transpose
+        // is unmistakable.
+        let payload = serde_json::json!([[11, 12, 13], [21, 22, 23]]);
+        let payload_variant = crate::value::json_to_variant(&payload, |_| {
+            panic!("no $ole_ref in this payload")
+        })
+        .expect("json_to_variant should build a 2-D SAFEARRAY");
+
+        let range_v = invoke_member(&sheet, "Range", vec![VARIANT::from("A1:C2")], vec![])
+            .expect("Range(A1:C2)");
+        let range = dispatch_from_variant(&range_v);
+        invoke_member(&range, "Value=", vec![payload_variant], vec![]).expect("Range.Value = 2-D array");
+
+        // B1 is row 1, column 2 -- it must hold 12, not 21.
+        let b1_v = invoke_member(&sheet, "Range", vec![VARIANT::from("B1")], vec![]).expect("Range(B1)");
+        let b1 = dispatch_from_variant(&b1_v);
+        let b1_value = invoke_member(&b1, "Value", vec![], vec![]).expect("B1.Value");
+        let b1_json = crate::value::variant_to_json(&b1_value, |_| panic!("B1 should be a scalar"));
+        assert_eq!(
+            b1_json,
+            serde_json::json!(12.0),
+            "B1 must be the first row's second element -- getting 21 means the \
+             SAFEARRAY dimensions are transposed"
+        );
+
+        // ...and read the whole range back as one array.
+        let read_v = invoke_member(&range, "Value", vec![], vec![]).expect("Range.Value");
+        let read_json = crate::value::variant_to_json(&read_v, |_| panic!("range should be an array"));
+        assert_eq!(
+            read_json,
+            serde_json::json!([[11.0, 12.0, 13.0], [21.0, 22.0, 23.0]]),
+            "the bulk read must come back in the same shape it was written"
+        );
+
+        invoke_member(&xl, "Quit", vec![], vec![]).expect("Quit");
+
+        // Drop every COM handle before CoUninitialize -- letting them drop
+        // afterward can leak the underlying process (see session.rs's note
+        // on ordering).
+        drop(b1);
+        drop(b1_v);
+        drop(range);
+        drop(range_v);
+        drop(sheet);
+        drop(sheet_v);
+        drop(sheets);
+        drop(sheets_v);
+        drop(workbooks);
+        drop(workbooks_v);
+        drop(xl);
+        unsafe {
+            CoUninitialize();
+        }
+    }
+
+    /// The outbound half of the argument-order pair. Nothing else in this
+    /// repo passes more than ONE positional argument to Excel, so
+    /// `raw_invoke`'s `positional.reverse()` -- the opposite of what the sink
+    /// does on the way in -- has never been exercised against a live server;
+    /// a one-argument call cannot tell the two directions apart.
+    ///
+    /// Excel is the arbiter. `Cells(row, column)` and `Offset(rows, columns)`
+    /// both take two numbers whose meanings differ, and `Address` reports back
+    /// which cell was meant, so a swap is unmistakable: Cells(2, 3) is $C$2,
+    /// and a reversed call would answer $B$3.
+    #[test]
+    fn test_positional_arguments_reach_excel_in_order() {
+        // Held for the whole test -- see EXCEL_TEST_LOCK's doc comment.
+        let _guard = lock_excel_for_test();
+
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+        }
+        let xl = create_instance("Excel.Application").expect("CreateObject(Excel.Application)");
+        invoke_member(&xl, "Visible=", vec![VARIANT::from(false)], vec![]).expect("Visible=false");
+        invoke_member(&xl, "DisplayAlerts=", vec![VARIANT::from(false)], vec![])
+            .expect("DisplayAlerts=false");
+
+        let workbooks = dispatch_from_variant(&invoke_member(&xl, "Workbooks", vec![], vec![]).unwrap());
+        invoke_member(&workbooks, "Add", vec![], vec![]).expect("Workbooks.Add");
+        let sheets = dispatch_from_variant(&invoke_member(&xl, "Worksheets", vec![], vec![]).unwrap());
+        let sheet = dispatch_from_variant(
+            &invoke_member(&sheets, "", vec![VARIANT::from(1i32)], vec![]).unwrap(),
+        );
+
+        let address_of = |target: &IDispatch| -> String {
+            let v = invoke_member(target, "Address", vec![], vec![]).expect("Range.Address");
+            crate::value::variant_to_json(&v, |_| panic!("Address is a string"))
+                .as_str()
+                .expect("Address is a string")
+                .to_string()
+        };
+
+        // Cells(row, column): row 2, column 3 is C2.
+        let c2 = dispatch_from_variant(
+            &invoke_member(
+                &sheet,
+                "Cells",
+                vec![VARIANT::from(2i32), VARIANT::from(3i32)],
+                vec![],
+            )
+            .expect("Cells(2, 3)"),
+        );
+        let c2_address = address_of(&c2);
+
+        // ...and the other way round, so a test that passed on symmetry
+        // (a call that reads the same reversed) cannot exist here.
+        let a5 = dispatch_from_variant(
+            &invoke_member(
+                &sheet,
+                "Cells",
+                vec![VARIANT::from(5i32), VARIANT::from(1i32)],
+                vec![],
+            )
+            .expect("Cells(5, 1)"),
+        );
+        let a5_address = address_of(&a5);
+
+        // A different method with the same shape: Offset(rows, columns) from
+        // A1 by one row and two columns is C2.
+        let a1 = dispatch_from_variant(
+            &invoke_member(&sheet, "Range", vec![VARIANT::from("A1")], vec![]).expect("Range(A1)"),
+        );
+        let offset = dispatch_from_variant(
+            &invoke_member(
+                &a1,
+                "Offset",
+                vec![VARIANT::from(1i32), VARIANT::from(2i32)],
+                vec![],
+            )
+            .expect("Range(A1).Offset(1, 2)"),
+        );
+        let offset_address = address_of(&offset);
+
+        drop(offset);
+        drop(a1);
+        drop(a5);
+        drop(c2);
+        drop(sheet);
+        drop(sheets);
+        drop(workbooks);
+        invoke_member(&xl, "Quit", vec![], vec![]).expect("Quit");
+        drop(xl);
+        unsafe {
+            CoUninitialize();
+        }
+
+        assert_eq!(
+            c2_address, "$C$2",
+            "Cells(2, 3) is row 2, column 3; $B$3 means the positional arguments reached \
+             Excel in the wrong order"
+        );
+        assert_eq!(
+            a5_address, "$A$5",
+            "Cells(5, 1) is row 5, column 1; $E$1 means the positional arguments reached \
+             Excel in the wrong order"
+        );
+        assert_eq!(
+            offset_address, "$C$2",
+            "Range(A1).Offset(1, 2) moves one row down and two columns right; $B$3 means \
+             the positional arguments reached Excel in the wrong order"
+        );
+    }
+
     #[test]
     fn test_get_active_object_fails_with_mk_e_unavailable_when_word_is_not_running() {
         // The empirical check this whole feature's fallback condition
@@ -604,5 +1034,100 @@ mod tests {
         unsafe {
             CoUninitialize();
         }
+    }
+
+    /// Writing a date and reading a date back proves nothing by itself:
+    /// Excel turns a date-shaped string in a General cell into a real date
+    /// on its own, so that assertion passes even for the broken path where a
+    /// Time was serialised as a string. This writes the same value both ways
+    /// and requires the two to be distinguishable.
+    ///
+    /// The string half uses Ruby's actual `Time#to_s` shape (with a UTC
+    /// offset), not a bare "YYYY-MM-DD HH:MM:SS" -- Step 1's probe found
+    /// that Excel silently auto-parses the latter into a real date too
+    /// (matching Value2, NumberFormat and all), which would make this test
+    /// pass even for the broken path it exists to catch. The offset suffix
+    /// is what the design spec's own example uses, and it is what actually
+    /// leaves Excel unable to recognise the string as a date, so the two
+    /// paths only diverge with it present.
+    #[test]
+    fn test_a_tagged_date_reaches_excel_as_a_date_not_as_text() {
+        // Held for the whole test -- see EXCEL_TEST_LOCK's doc comment.
+        let _guard = lock_excel_for_test();
+
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap(); }
+        let xl = create_instance("Excel.Application").expect("CreateObject(Excel.Application)");
+        invoke_member(&xl, "Visible=", vec![VARIANT::from(false)], vec![]).unwrap();
+        invoke_member(&xl, "DisplayAlerts=", vec![VARIANT::from(false)], vec![]).unwrap();
+        let workbooks = dispatch_from_variant(&invoke_member(&xl, "Workbooks", vec![], vec![]).unwrap());
+        invoke_member(&workbooks, "Add", vec![], vec![]).unwrap();
+        let sheets = dispatch_from_variant(&invoke_member(&xl, "Worksheets", vec![], vec![]).unwrap());
+        let sheet = dispatch_from_variant(
+            &invoke_member(&sheets, "", vec![VARIANT::from(1i32)], vec![]).unwrap(),
+        );
+
+        let cell = |addr: &str| {
+            dispatch_from_variant(
+                &invoke_member(&sheet, "Range", vec![VARIANT::from(addr)], vec![])
+                    .unwrap_or_else(|e| panic!("Range({addr}): {e}")),
+            )
+        };
+
+        // A1 via the tagged path this task exists to prove.
+        let tagged = crate::value::json_to_variant(
+            &serde_json::json!({"$type": "time", "iso8601": "2026-08-31T09:30:00"}),
+            |_| panic!("no $ole_ref in this payload"),
+        )
+        .expect("the tag must convert");
+        invoke_member(&cell("A1"), "Value=", vec![tagged], vec![]).expect("A1 = date");
+
+        // A2 as text, the way the broken path used to send it: Ruby's
+        // JSON.generate turns a Time into Time#to_s, e.g.
+        // "2026-08-31 09:30:00 +0900" (see the design spec's own example).
+        invoke_member(
+            &cell("A2"),
+            "Value=",
+            vec![VARIANT::from("2026-08-31 09:30:00 +0900")],
+            vec![],
+        )
+        .expect("A2 = string");
+
+        // Discriminator (Step 1): Range.Value2. Measured during
+        // implementation: it returns a plain number for a genuine VT_DATE
+        // cell and a string for a text cell that Excel did not itself
+        // recognise as a date -- confirmed on this Wine + Excel build with
+        // the exact string above. Both must actually be present for the
+        // assertion to mean anything.
+        let a1_value2 = invoke_member(&cell("A1"), "Value2", vec![], vec![]).expect("A1.Value2");
+        let a2_value2 = invoke_member(&cell("A2"), "Value2", vec![], vec![]).expect("A2.Value2");
+        let a1_value2_json = crate::value::variant_to_json(&a1_value2, |_| panic!("A1.Value2 should be a scalar"));
+        let a2_value2_json = crate::value::variant_to_json(&a2_value2, |_| panic!("A2.Value2 should be a scalar"));
+        assert!(
+            a1_value2_json.is_number(),
+            "A1 (tagged date) must read back as a numeric serial via Value2, got {a1_value2_json:?}"
+        );
+        assert!(
+            a2_value2_json.is_string(),
+            "A2 (broken-path string) must read back as text via Value2 -- if it doesn't, Excel \
+             auto-converted it and this test cannot tell the two paths apart; got {a2_value2_json:?}"
+        );
+        drop(a2_value2);
+        drop(a1_value2);
+
+        // The value itself must also survive.
+        let a1 = invoke_member(&cell("A1"), "Value", vec![], vec![]).expect("A1.Value");
+        assert_eq!(
+            crate::value::variant_to_json(&a1, |_| panic!("A1 should be a scalar")),
+            serde_json::json!({"$type": "time", "iso8601": "2026-08-31T09:30:00"}),
+            "the date must read back unchanged"
+        );
+
+        drop(a1);
+        drop(sheet);
+        drop(sheets);
+        drop(workbooks);
+        invoke_member(&xl, "Quit", vec![], vec![]).expect("Quit");
+        drop(xl);
+        unsafe { CoUninitialize(); }
     }
 }

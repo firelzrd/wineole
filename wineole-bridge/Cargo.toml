@@ -1,6 +1,6 @@
 [package]
 name = "wineole-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -8,12 +8,21 @@ name = "wineole-bridge"
 path = "src/main.rs"
 
 [dependencies]
+# No "implement" feature: this crate writes its one COM object's vtable by
+# hand (see src/sink.rs on why #[implement]'s QueryInterface aborts here), so
+# nothing needs the macro.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Com_Marshal",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
+    "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+windows-core = "0.58"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

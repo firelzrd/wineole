@@ -13,5 +13,6 @@ class ErrorsTest < Minitest::Test
     assert WineOLE::StaleReferenceError.ancestors.include?(WineOLE::Error)
     assert WineOLE::RemoteError.ancestors.include?(WineOLE::Error)
     assert WineOLE::ProtocolError.ancestors.include?(WineOLE::Error)
+    assert WineOLE::InstanceClosingError.ancestors.include?(WineOLE::Error)
   end
 end

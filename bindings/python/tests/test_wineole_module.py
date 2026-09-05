@@ -83,6 +83,51 @@ class WineOLEModuleTest(unittest.TestCase):
             self.assertIsNot(first_default, second_default,
                               'close() must force the next .create to open a fresh client')
 
+    def test_default_client_is_public(self):
+        self.assertTrue(hasattr(wineole, 'default_client'),
+                         'default_client must be public so bundled wrappers like the Office '
+                         'layer can reach the one connection this module already owns, instead '
+                         'of opening a second one')
+        self.assertIn('default_client', wineole.__all__)
+
+    def test_default_client_returns_the_lazily_initialized_client(self):
+        fake_client = FakeClient('shared')
+        with patch.object(wineole.Client, 'open', staticmethod(lambda **kwargs: fake_client)):
+            result = wineole.default_client()
+            self.assertIs(result, fake_client)
+
+    def test_events_and_subscription_are_re_exported(self):
+        # `sub = obj.ole_events.on(...)` hands the caller a Subscription, and
+        # `isinstance(x, wineole.Subscription)` is how they check one without
+        # having to know the internal module layout.
+        from wineole.events import Events, Subscription
+
+        self.assertIs(wineole.Events, Events)
+        self.assertIs(wineole.Subscription, Subscription)
+        self.assertIn('Events', wineole.__all__)
+        self.assertIn('Subscription', wineole.__all__)
+
+    def test_error_classes_are_re_exported(self):
+        # `except wineole.InstanceClosingError` is how a caller distinguishes
+        # "this instance is closing" from any other remote failure, and it can
+        # only do that if the front door re-exports the class the way it
+        # re-exports every other error this client raises.
+        from wineole.errors import (
+            WineOLEError, NotSerializableError, StaleReferenceError, ProtocolError,
+            RemoteError, InstanceClosingError,
+        )
+
+        for name, klass in (
+            ('WineOLEError', WineOLEError),
+            ('NotSerializableError', NotSerializableError),
+            ('StaleReferenceError', StaleReferenceError),
+            ('ProtocolError', ProtocolError),
+            ('RemoteError', RemoteError),
+            ('InstanceClosingError', InstanceClosingError),
+        ):
+            self.assertIs(getattr(wineole, name), klass)
+            self.assertIn(name, wineole.__all__)
+
     def test_connect_or_create_uses_the_default_client(self):
         class FakeClientWithConnectOrCreate(FakeClient):
             def connect_or_create(self, class_name):

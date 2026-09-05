@@ -79,6 +79,25 @@ class WineOLETest < Minitest::Test
     WineOLE::Client.define_singleton_method(:open, original_open)
   end
 
+  def test_default_client_is_public
+    assert WineOLE.public_methods.include?(:default_client),
+      'default_client must be public so bundled wrappers like MSOffice::Excel can reach ' \
+      'the one connection this module already owns, instead of opening a second one'
+  end
+
+  def test_default_client_returns_the_lazily_initialized_client
+    fake_client = Object.new
+    def fake_client.close = nil
+
+    original_open = WineOLE::Client.method(:open)
+    WineOLE::Client.define_singleton_method(:open) { |**_kwargs| fake_client }
+
+    result = WineOLE.default_client
+    assert_same fake_client, result
+  ensure
+    WineOLE::Client.define_singleton_method(:open, original_open)
+  end
+
   def test_connect_or_create_uses_the_default_client
     fake_client = Object.new
     def fake_client.connect_or_create(class_name) = "coc:#{class_name}"

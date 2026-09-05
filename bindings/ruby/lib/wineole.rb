@@ -1,6 +1,8 @@
 require_relative 'wineole/errors'
 require_relative 'wineole/client'
 require_relative 'wineole/proxy'
+require_relative 'wineole/dispatcher'
+require_relative 'wineole/events'
 
 module WineOLE
   @default_client = nil
@@ -25,12 +27,19 @@ module WineOLE
   # racing on a nil default contend for the lock, and only the actual
   # winner calls Client.open -- everyone else sees it already set once they
   # acquire the lock, and the `||=` means they never call Client.open again.
+  #
+  # Public (a deliberate exception to "the core layer is not changed" --
+  # the same exception, and for the same reason, as Client#loopback?):
+  # bundled wrappers such as WineOLE::MSOffice::Excel need the Client their
+  # Proxy belongs to (Book needs it to answer #loopback?), and this module is
+  # already the layer holding that connection. Making the caller guess, or
+  # open a second connection just to answer that question, would be worse
+  # than letting the layer that already knows the answer say so.
   def self.default_client
     return @default_client if @default_client
 
     @mutex.synchronize { @default_client ||= Client.open }
   end
-  private_class_method :default_client
 
   def self.create(class_name)
     default_client.create(class_name)

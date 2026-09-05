@@ -1,4 +1,4 @@
-"""Python client for wineole — mirrors Ruby's `lib/wineole.rb` front door.
+"""Python client for wineole -- mirrors Ruby's `lib/wineole.rb` front door.
 
 Re-exports the same public names the Ruby entry point does, so that
 `import wineole; wineole.Client(...)` works without callers needing to know
@@ -7,14 +7,19 @@ the internal module layout.
 
 import threading
 
-from .errors import WineOLEError, NotSerializableError, StaleReferenceError, ProtocolError, RemoteError
+from .errors import (
+    WineOLEError, NotSerializableError, StaleReferenceError, ProtocolError, RemoteError,
+    InstanceClosingError,
+)
 from .client import Client
 from .proxy import Proxy, Member
+from .events import Events, Subscription
 
 __all__ = [
     'WineOLEError', 'NotSerializableError', 'StaleReferenceError', 'ProtocolError', 'RemoteError',
-    'Client', 'Proxy', 'Member',
-    'open', 'create', 'connect', 'connect_or_create', 'close',
+    'InstanceClosingError',
+    'Client', 'Proxy', 'Member', 'Events', 'Subscription',
+    'open', 'create', 'connect', 'connect_or_create', 'close', 'default_client',
 ]
 
 _default_client = None
@@ -56,6 +61,21 @@ def _get_default_client():
         if _default_client is None:
             _default_client = Client.open()
         return _default_client
+
+
+def default_client():
+    """Public alias for _get_default_client().
+
+    A deliberate exception to "the core layer is not changed" -- the same
+    exception, and for the same reason, as Client.loopback: bundled
+    wrappers (the Office layer's Excel, mirrored from Ruby's
+    WineOLE::Office::Excel) need the Client their Proxy belongs to, and
+    this module is already the layer holding that connection. Making a
+    wrapper guess, or open a second connection just to answer that
+    question, would be worse than letting the layer that already knows
+    the answer say so. _get_default_client and its existing callers are
+    left untouched; this just gives outside code the same access."""
+    return _get_default_client()
 
 
 def create(class_name):

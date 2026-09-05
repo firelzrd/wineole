@@ -6,9 +6,13 @@ runner = "wine"
 
 [target.aarch64-pc-windows-gnullvm]
 # Requires llvm-mingw's bin/ directory on PATH (not packaged for apt --
-# see README.md's "Prebuilt binaries" section for where to get it). No
-# `runner`: this host has no way to execute an ARM64 Windows binary at all
-# (no ARM64 CPU emulation under Wine on x86_64 Linux) -- this target is
-# cross-compiled and shipped, but has never been run or tested by anyone
-# working on this project.
+# see README.md's "Prebuilt binaries" section for where to get it). On
+# this project's development host it is installed at
+# ~/.local/share/llvm-mingw/, so a build needs:
+#   PATH="$HOME/.local/share/llvm-mingw/bin:$PATH" cargo build --release \
+#     --target aarch64-pc-windows-gnullvm
+# No `runner`: this host has no way to execute an ARM64 Windows binary at
+# all (no ARM64 CPU emulation under Wine on x86_64 Linux) -- this target
+# is cross-compiled and shipped, but has never been run or tested by
+# anyone working on this project.
 linker = "aarch64-w64-mingw32-clang"

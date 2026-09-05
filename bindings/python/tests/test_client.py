@@ -10,7 +10,7 @@ import weakref
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from wineole.client import Client
-from wineole.errors import RemoteError, ProtocolError
+from wineole.errors import RemoteError, ProtocolError, InstanceClosingError
 from wineole.proxy import Proxy
 
 
@@ -71,6 +71,39 @@ class ClientTest(unittest.TestCase):
         thread.join()
         server.close()
 
+    def test_call_raises_instance_closing_error_when_the_bridge_reports_it(self):
+        # WineOLE::InstanceClosingError is the one remote error class this
+        # client resolves to its own local class rather than wrapping in a
+        # generic RemoteError -- so a caller can catch "this instance is
+        # closing" directly rather than inspecting RemoteError.remote_class.
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+
+        def run_server():
+            conn, _ = server.accept()
+            line = conn.makefile().readline()
+            req = json.loads(line)
+            error = {'class': 'WineOLE::InstanceClosingError', 'message': 'the instance is closing'}
+            conn.sendall((json.dumps({'id': req['id'], 'error': error}) + '\n').encode())
+            conn.close()
+
+        thread = threading.Thread(target=run_server)
+        thread.start()
+
+        sock = socket.create_connection(('127.0.0.1', port))
+        client = Client(sock)
+        try:
+            with self.assertRaises(InstanceClosingError) as ctx:
+                client.call('invoke', {})
+            self.assertEqual(str(ctx.exception), 'the instance is closing')
+        finally:
+            client.close()
+
+        thread.join()
+        server.close()
+
     def test_each_client_gets_a_distinct_never_reused_generation(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.bind(('127.0.0.1', 0))
@@ -91,7 +124,7 @@ class ClientTest(unittest.TestCase):
         try:
             # Consecutive, not merely distinct. Two *simultaneously live*
             # objects always have distinct id()s, so a bare assertNotEqual
-            # would still pass if `generation` were reverted to `id(self)` —
+            # would still pass if `generation` were reverted to `id(self)` --
             # the Ruby-style pattern this client deliberately avoids, because
             # CPython reuses an id() once its object is collected, while
             # Ruby's object_id never is. Asserting that client_b lands on
@@ -157,7 +190,7 @@ class ClientTest(unittest.TestCase):
             w.start()
         for w in workers:
             w.join(timeout=10)
-            self.assertFalse(w.is_alive(), "worker thread did not finish — likely deadlocked")
+            self.assertFalse(w.is_alive(), "worker thread did not finish -- likely deadlocked")
 
         client.close()
         server_thread.join(timeout=5)
@@ -250,6 +283,38 @@ class ClientTest(unittest.TestCase):
         thread.join()
         server.close()
 
+    def test_create_threads_cleanup_through_to_proxy_create(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        captured = {}
+
+        def run_server():
+            conn, _ = server.accept()
+            line = conn.makefile().readline()
+            captured['request'] = json.loads(line)
+            conn.sendall((json.dumps({'id': captured['request']['id'], 'result': {'$ole_ref': 7}}) + '\n').encode())
+            conn.close()
+
+        thread = threading.Thread(target=run_server)
+        thread.start()
+
+        sock = socket.create_connection(('127.0.0.1', port))
+        client = Client(sock)
+        try:
+            client.create('Excel.Application', cleanup={'steps': [['Quit']]})
+        finally:
+            client.close()
+
+        thread.join()
+        server.close()
+
+        self.assertEqual(captured['request']['params']['cleanup'], {
+            'steps': [{'name': 'Quit', 'args': []}],
+            'callback': False,
+        })
+
     def test_close_does_not_raise_when_called_twice(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.bind(('127.0.0.1', 0))
@@ -303,6 +368,111 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(conn.recv(1), b'', 'the peer must see EOF once __del__ closed the underlying socket')
         conn.close()
         server.close()
+
+
+class TestLoopback(unittest.TestCase):
+    def test_loopback_is_true_for_a_connection_to_127_0_0_1(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            sock = socket.create_connection(('127.0.0.1', port))
+            try:
+                self.assertTrue(
+                    Client(sock).loopback,
+                    'a connection to 127.0.0.1 must count as loopback',
+                )
+            finally:
+                sock.close()
+        finally:
+            server.close()
+
+    def test_loopback_matches_the_bridge_s_own_definition(self):
+        # The bridge decides whether a token is required with
+        # IpAddr::is_loopback(), which is true for all of 127.0.0.0/8 and ::1
+        # -- not just the literal 127.0.0.1. Path conversion keys off the same
+        # notion of "local", so the two must not drift apart.
+        #
+        # This asserts only on ipaddress directly, not on Client -- it
+        # documents that the stdlib's definition matches Rust's, but gives no
+        # coverage to the plumbing in `loopback` itself. See
+        # test_loopback_is_true_for_a_connection_to_ipv6_loopback below for
+        # that.
+        import ipaddress
+        self.assertTrue(ipaddress.ip_address('127.0.0.1').is_loopback)
+        self.assertTrue(ipaddress.ip_address('127.0.0.2').is_loopback)
+        self.assertTrue(ipaddress.ip_address('::1').is_loopback)
+        self.assertFalse(ipaddress.ip_address('192.168.1.50').is_loopback)
+
+    def test_loopback_is_true_for_a_connection_to_ipv6_loopback(self):
+        try:
+            server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            server.bind(('::1', 0))
+            server.listen(1)
+        except OSError as exc:
+            self.skipTest(f'IPv6 loopback is not available in this environment: {exc!r}')
+            return
+        port = server.getsockname()[1]
+        try:
+            sock = socket.create_connection(('::1', port))
+            try:
+                self.assertTrue(
+                    Client(sock).loopback,
+                    'a connection to ::1 must count as loopback',
+                )
+            finally:
+                sock.close()
+        finally:
+            server.close()
+
+    def test_loopback_is_false_once_the_peer_address_is_undeterminable(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            sock = socket.create_connection(('127.0.0.1', port))
+            client = Client(sock)
+            # client.close(), not sock.close(): makefile() holds its own
+            # io-ref on the socket (see Client.close's comment), so closing
+            # the raw socket alone leaves the underlying fd -- and therefore
+            # getpeername() -- alive. Only closing the Client actually makes
+            # the peer address undeterminable.
+            client.close()
+
+            self.assertFalse(
+                client.loopback,
+                'loopback must fail closed (False), not raise, once the peer address cannot be determined',
+            )
+        finally:
+            server.close()
+
+
+class TestTryConnectNoDelay(unittest.TestCase):
+    def test_try_connect_sets_tcp_nodelay_on_the_socket(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            sock = Client._try_connect('127.0.0.1', port)
+            self.assertIsNotNone(sock, '_try_connect should have connected')
+            try:
+                # Mirrors client.rb's try_connect. Insurance against the
+                # Nagle/delayed-ACK stall fixed on the bridge side: requests
+                # already go out in a single write, so this changes nothing
+                # today, but it keeps a future multi-write request path from
+                # reintroducing a 40 ms per-RPC penalty.
+                self.assertEqual(
+                    1,
+                    sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY),
+                    '_try_connect must set TCP_NODELAY',
+                )
+            finally:
+                sock.close()
+        finally:
+            server.close()
 
 
 if __name__ == '__main__':

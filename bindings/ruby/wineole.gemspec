@@ -1,6 +1,6 @@
 Gem::Specification.new do |spec|
   spec.name = 'wineole'
-  spec.version = '0.1.0'
+  spec.version = '0.2.0'
   spec.summary = 'Drive Win32OLE/COM automation of Wine-hosted Windows apps from Ruby'
   spec.description = <<~DESC
     A bridge (Rust, cross-compiled to run under Wine) plus a Ruby client
@@ -16,6 +16,8 @@ Gem::Specification.new do |spec|
     'bug_tracker_uri' => 'https://github.com/firelzrd/wineole/issues',
   }
   spec.required_ruby_version = '>= 3.0'
-  spec.files = Dir['lib/**/*.rb'] + Dir['wineole-bridge-dist/**/*'] + Dir['LICENSE']
+  spec.files = Dir['lib/**/*.rb'] + Dir['bin/*'] + Dir['wineole-bridge-dist/**/*'] + Dir['LICENSE']
+  spec.bindir = 'bin'
+  spec.executables = ['wineole-vba']
   spec.require_paths = ['lib']
 end

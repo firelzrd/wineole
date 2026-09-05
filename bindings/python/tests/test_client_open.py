@@ -26,7 +26,7 @@ class ClientOpenTest(unittest.TestCase):
 
         # open always pings to handshake, even on the
         # already-listening fast path (mirrors client.rb's
-        # test_pings_after_connecting_to_an_existing_bridge) — so this fake
+        # test_pings_after_connecting_to_an_existing_bridge) -- so this fake
         # server must actually accept and answer, or the handshake's
         # readline() blocks forever.
         def run_server():
@@ -81,7 +81,7 @@ class ClientOpenTest(unittest.TestCase):
             client.close()
 
     def test_raises_if_spawned_server_never_comes_up(self):
-        # Below 32768, outside Linux's default ephemeral range — see above.
+        # Below 32768, outside Linux's default ephemeral range -- see above.
         port = 22000 + (os.getpid() % 1000)
 
         def spawner(p):

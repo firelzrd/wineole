@@ -1,45 +1,17 @@
 require 'minitest/autorun'
+require 'timeout'
 require_relative '../lib/wineole'
+require_relative 'support/excel_integration_helper'
 
 class WineOLEIntegrationTest < Minitest::Test
-  BRIDGE_EXE = WineOLE::Client.default_bridge_path
+  include ExcelIntegrationHelper
 
-  # A fixed port, deliberately: a random one can never reuse an
-  # already-running bridge (standalone-started, or left by a previous run),
-  # which is the whole point of the connect-or-spawn logic — and it risks
-  # colliding with an unrelated service. With the connection-teardown handle
-  # release in place (server.rs) and the PID-scoped cleanup below, repeated
-  # runs on one port are clean.
-  PORT = 48042
-
-  def setup
-    @spawned_pids = []
-    @lockfile = WineOLE::Client.default_lockfile(PORT)
-    # Excel is started by COM activation, not by us, so it has no PID we can
-    # capture at spawn time. Snapshot what was already running instead, so
-    # teardown can clean up only what this run caused — never someone else's
-    # Excel, possibly with unsaved work, as the old `pkill -f EXCEL.EXE` did.
-    @pre_existing_excel_pids = excel_pids
-  end
+  BRIDGE_EXE = ExcelIntegrationHelper::BRIDGE_EXE
 
   def test_end_to_end_excel_automation_via_the_bridge
-    skip "bridge exe not built: #{BRIDGE_EXE}" unless File.exist?(BRIDGE_EXE)
-
-    client = WineOLE.open(
-      port: PORT,
-      spawner: lambda { |p|
-        pid = Process.spawn('wine', BRIDGE_EXE, p.to_s, %i[out err] => File::NULL)
-        @spawned_pids << pid
-        Process.detach(pid)
-        pid
-      },
-      lockfile: @lockfile,
-      timeout: 20
-    )
     root_handle = nil
 
-    begin
-      xl = WineOLE.create('Excel.Application')
+    with_excel do |xl|
       root_handle = xl.ole_handle
       xl.Visible = false
       xl.DisplayAlerts = false
@@ -72,9 +44,6 @@ class WineOLEIntegrationTest < Minitest::Test
       assert_match(/0x[0-9A-F]{8}/, err.message, "expected an HRESULT in #{err.message.inspect}")
 
       xl.Quit
-    ensure
-      client.close
-      WineOLE.instance_variable_set(:@default_client, nil)
     end
 
     # Dropping the connection — rather than releasing every handle one by
@@ -113,6 +82,176 @@ class WineOLEIntegrationTest < Minitest::Test
     warn 'note: EXCEL.EXE outlived its session (known Wine COM release flake)' unless excel_gone?(timeout: 20)
   end
 
+  def test_bulk_range_round_trip_preserves_types
+    with_excel do |xl|
+      xl.Visible = false
+      xl.DisplayAlerts = false
+      xl.Workbooks.Add
+      sheet = xl.Worksheets[1]
+
+      # One write for the whole block, not nine.
+      sheet.Range('A1:C3').Value = [
+        ['text', 1, 2.5],
+        ['', nil, -3],
+        ['ünïcödé ✓', 0, 1000000],
+      ]
+
+      rows = sheet.Range('A1:C3').Value
+
+      assert_equal 3, rows.length, 'a 3x3 range must read back as 3 rows'
+      assert_equal 3, rows[0].length, 'each row must have 3 columns (not transposed)'
+      assert_equal 'text', rows[0][0]
+      assert_equal 1.0, rows[0][1]
+      assert_equal 2.5, rows[0][2]
+      # A nil written into a cell comes back as nil.
+      assert_nil rows[1][1], 'a nil written into a cell must read back as nil'
+      # An empty string written into a cell comes back as an empty cell (nil),
+      # not as ''.
+      assert_nil rows[1][0], "an empty string written into a cell must read back as nil, not ''"
+      assert_equal(-3.0, rows[1][2])
+      assert_equal 'ünïcödé ✓', rows[2][0]
+      assert_equal 1_000_000.0, rows[2][2]
+
+      # A date cell must arrive as a Time, not as a raw {"$type" => "time"}
+      # hash -- this is what the recursive decode exists for.
+      #
+      # A 1x1 range's Value is a bare scalar, not [[v]] (see
+      # test_range_value_shape_depends_on_range_size) -- so `date` here is
+      # the Time itself, not a row containing it. That only proves
+      # *top-level* decode of a tagged value.
+      sheet.Range('E1').Value = '2026-08-31'
+      sheet.Range('E1').NumberFormat = 'yyyy-mm-dd'
+      date = sheet.Range('E1:E1').Value
+      assert_instance_of Time, date,
+        'a date inside a bulk read must decode to a Time'
+      assert_equal 2026, date.year
+      assert_equal 8, date.month
+      assert_equal 31, date.day
+
+      # The assertion above says nothing about a tagged value *nested*
+      # inside a returned array -- which is exactly the case the recursive
+      # decode exists for (a bulk Range.Value read on anything larger than
+      # 1x1 returns an array of rows, per
+      # test_range_value_shape_depends_on_range_size). Write two dates side
+      # by side and read them back as a 1x2 range, so reaching either date
+      # means indexing into the returned array: [[Time, Time]], not a bare
+      # Time.
+      sheet.Range('F1').Value = '2026-09-01'
+      sheet.Range('F1').NumberFormat = 'yyyy-mm-dd'
+      dates = sheet.Range('E1:F1').Value
+      assert_equal 1, dates.length, 'a 1x2 range must read back as 1 row'
+      assert_equal 2, dates[0].length, 'that row must have 2 columns'
+      assert_instance_of Time, dates[0][0],
+        'a date nested inside a returned array must decode to a Time, not a raw {"$type"=>"time"} hash'
+      assert_instance_of Time, dates[0][1],
+        'a date nested inside a returned array must decode to a Time, not a raw {"$type"=>"time"} hash'
+      assert_equal 2026, dates[0][0].year
+      assert_equal 8, dates[0][0].month
+      assert_equal 31, dates[0][0].day
+      assert_equal 2026, dates[0][1].year
+      assert_equal 9, dates[0][1].month
+      assert_equal 1, dates[0][1].day
+    end
+  end
+
+  def test_writing_a_time_directly_round_trips_as_a_date
+    with_excel do |xl|
+      xl.Visible = false
+      xl.DisplayAlerts = false
+      xl.Workbooks.Add
+      sheet = xl.Worksheets[1]
+
+      # A Time assigned straight into a cell -- no string-plus-NumberFormat
+      # workaround -- must land as a genuine VT_DATE and read back as a
+      # Time. This asserts on the *type* read back rather than on display
+      # text: Excel's own Range.Value setter auto-applies a date format to
+      # a still-General cell (see README), so a passing string-based
+      # workaround and a genuine VT_DATE can look identical on screen --
+      # only the read-back type tells them apart.
+      written = Time.new(2026, 8, 31, 9, 30, 45)
+      sheet.Range('H1').Value = written
+      read_back = sheet.Range('H1:H1').Value
+      assert_instance_of Time, read_back,
+        'a Time written straight into a cell must read back as a Time, not a String or a raw hash'
+      assert_equal written.to_i, read_back.to_i,
+        'a direct Time write must round-trip to the second'
+
+      # The same, but nested inside a 2-D bulk write -- the recursive case
+      # in value.rs's SAFEARRAY encode/decode, which the single-cell write
+      # above does not exercise. Mixed with plain strings so the test also
+      # proves the recursion doesn't misencode/misdecode a date's
+      # neighbors.
+      written_a = Time.new(2026, 9, 1, 12, 0, 0)
+      written_b = Time.new(2026, 9, 2, 18, 15, 30)
+      sheet.Range('I1:J2').Value = [
+        [written_a, 'not a date'],
+        ['still not a date', written_b],
+      ]
+      grid = sheet.Range('I1:J2').Value
+
+      assert_instance_of Time, grid[0][0],
+        'a date written inside a bulk 2-D array must read back as a Time, indexed out of the returned array'
+      assert_instance_of Time, grid[1][1],
+        'a date written inside a bulk 2-D array must read back as a Time, indexed out of the returned array'
+      assert_equal written_a.to_i, grid[0][0].to_i,
+        'a bulk-written date must round-trip to the second'
+      assert_equal written_b.to_i, grid[1][1].to_i,
+        'a bulk-written date must round-trip to the second'
+      assert_equal 'not a date', grid[0][1]
+      assert_equal 'still not a date', grid[1][0]
+    end
+  end
+
+  def test_round_trip_latency_is_not_stalled_by_nagle
+    with_excel do |xl|
+      xl.Version # warm up: the first call also starts Excel
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      100.times { xl.Version }
+      per_call_ms = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) / 100 * 1000
+
+      # Before the single-write fix this was 42.6 ms per call, essentially
+      # all of it the client's ~40 ms delayed-ACK timer waiting for a
+      # newline Nagle was holding. Afterwards it is ~1.3 ms. 20 ms sits
+      # clear of both, so this catches a regression without being flaky on
+      # a loaded machine.
+      assert_operator per_call_ms, :<, 20.0,
+        "a round trip took #{'%.1f' % per_call_ms} ms; a Nagle/delayed-ACK stall " \
+        'has probably come back (see protocol.rs write_response)'
+    end
+  end
+
+  # Range#Value's result shape depends on the range's dimensions -- this is
+  # Excel's own contract, not a choice this project made, and Phase 2's
+  # wrapper has to normalize it. Pin it here so a future change to the
+  # conversion layer cannot quietly alter it out from under that wrapper.
+  def test_range_value_shape_depends_on_range_size
+    with_excel do |xl|
+      xl.Visible = false
+      xl.DisplayAlerts = false
+      xl.Workbooks.Add
+      sheet = xl.Worksheets[1]
+
+      sheet.Range('A1').Value = 42
+      sheet.Range('B1').Value = 'right'
+      sheet.Range('A2').Value = 'below'
+
+      # A 1x1 range collapses to a bare scalar, whether addressed as a
+      # single cell or as an explicit 1x1 range -- not [[42.0]].
+      assert_equal 42.0, sheet.Range('A1').Value
+      assert_equal 42.0, sheet.Range('A1:A1').Value
+
+      # Anything larger than 1x1 comes back as an array of row arrays.
+      assert_equal [[42.0, 'right']], sheet.Range('A1:B1').Value
+      assert_equal [[42.0], ['below']], sheet.Range('A1:A2').Value
+
+      # An empty 1x1 range is a bare nil, not [[nil]].
+      assert_nil sheet.Range('J1:J1').Value,
+        'an empty 1x1 range must read back as a bare nil, not [[nil]]'
+      assert_equal [[nil], [nil]], sheet.Range('J1:J2').Value
+    end
+  end
+
   def test_a_second_client_reuses_the_already_running_bridge
     skip "bridge exe not built: #{BRIDGE_EXE}" unless File.exist?(BRIDGE_EXE)
 
@@ -128,7 +267,13 @@ class WineOLEIntegrationTest < Minitest::Test
   end
 
   def test_connect_or_create_creates_then_a_second_call_attaches
-    skip "bridge exe not built: #{BRIDGE_EXE}" unless File.exist?(BRIDGE_EXE)
+    # Deliberately uses with_bridge rather than with_excel: with_excel
+    # already creates an Excel instance via client.create, which would
+    # itself be the "first" instance and defeat this test's point -- that
+    # the *first* connect_or_create call is what creates one. This test
+    # needs a from-scratch bring-up so nothing exists yet when it calls
+    # connect_or_create for the first time.
+    #
     # Not `excel_pids - @pre_existing_excel_pids` -- setup snapshots
     # @pre_existing_excel_pids fresh before every test, so a leftover Excel
     # from a sibling test is captured *into* that snapshot and the
@@ -140,8 +285,7 @@ class WineOLEIntegrationTest < Minitest::Test
            're-run this test in isolation or investigate the leftover instance'
     end
 
-    client = connect
-    begin
+    with_bridge do |client|
       xl = client.connect_or_create('Excel.Application')
       assert xl.ole_created?, 'the first connect_or_create must create a new instance (nothing was running)'
       xl.Visible = false
@@ -157,76 +301,113 @@ class WineOLEIntegrationTest < Minitest::Test
       assert_equal false, xl2.DisplayAlerts, 'xl and xl2 must observe the same live Excel instance'
 
       xl.Quit
-    ensure
-      client.close
     end
   end
 
-  private
-
-  def connect
-    WineOLE::Client.open(
-      port: PORT,
-      spawner: lambda { |p|
-        pid = Process.spawn('wine', BRIDGE_EXE, p.to_s, %i[out err] => File::NULL)
-        @spawned_pids << pid
-        Process.detach(pid)
-        pid
-      },
-      lockfile: @lockfile,
-      timeout: 20
-    )
-  end
-
-  # Has the bridge dropped `handle` from its routing table? Any other
-  # outcome (a successful invoke, or a different error class) means the
-  # handle is still live and is reported as "not yet reclaimed".
-  def handle_reclaimed?(client, handle, timeout:)
-    deadline = Time.now + timeout
-    loop do
+  # THE regression test for the thread split. A callback that calls COM must
+  # get an answer. Running callbacks on the reader thread makes this hang
+  # forever, because nothing is left to read the response.
+  def test_a_callback_can_call_com_and_get_an_answer
+    with_bridge do |client|
+      xl = client.create('Excel.Application')
       begin
-        client.call('invoke', {handle: handle, name: 'Version', args: [], named: {}})
-      rescue WineOLE::RemoteError => e
-        return true if e.remote_class == 'WineOLE::StaleReferenceError'
+        xl.Visible = false
+        xl.DisplayAlerts = false
+        got = Queue.new
+        xl.ole_events.on('SheetChange') do |_sheet, target|
+          got << target.Address
+        end
+        book = xl.Workbooks.Add
+        book.Worksheets(1).Range('A1').Value = 42
+
+        address = nil
+        begin
+          Timeout.timeout(30) { address = got.pop }
+        rescue Timeout::Error
+          # A verdict, not an exception escaping: this is the failure this
+          # test exists to report, and saying so is the difference between a
+          # suite that tells you what broke and one that times out.
+          flunk 'the callback never got an answer within 30s -- with callbacks running on ' \
+                'the reader thread there is nobody left to read the response to the ' \
+                "callback's own COM call, and the whole connection is wedged"
+        end
+        assert_match(/\$?A\$?1/, address, 'the callback made a COM call and got an answer back')
+      ensure
+        # Bounded, because the mutation this test exists to catch wedges the
+        # connection: an unbounded Quit on it hangs the whole suite instead
+        # of letting this test fail. See quit_bounded.
+        quit_bounded(xl)
       end
-      return false if Time.now > deadline
-
-      sleep 0.5
     end
   end
 
-  def excel_pids
-    `pgrep -f EXCEL.EXE`.split.map(&:to_i)
-  rescue StandardError
-    []
-  end
+  # `on` is the only thing the caller touches. subscribe and Advise are
+  # derived; removing that derivation makes this fail.
+  def test_registering_a_callback_is_all_it_takes
+    with_bridge do |client|
+      xl = client.create('Excel.Application')
+      begin
+        xl.Visible = false
+        xl.DisplayAlerts = false
+        fired = Queue.new
+        xl.ole_events.on('WorkbookOpen') { fired << :open }
+        xl.ole_events.on('SheetChange') { fired << :changed }
+        book = xl.Workbooks.Add
+        book.Worksheets(1).Range('B2').Value = 1
 
-  def excel_gone?(timeout:)
-    deadline = Time.now + timeout
-    loop do
-      return true if (excel_pids - @pre_existing_excel_pids).empty?
-      return false if Time.now > deadline
-
-      sleep 0.5
+        begin
+          Timeout.timeout(30) { assert_equal :changed, fired.pop }
+        rescue Timeout::Error
+          flunk 'no event arrived within 30s: registering a callback must be all it takes'
+        end
+      ensure
+        quit_bounded(xl)
+      end
     end
   end
 
-  def teardown
-    # Kill only what this run started, by PID. The old `pkill -f EXCEL.EXE`
-    # killed every Excel on the machine — including unrelated ones with
-    # unsaved work — and never killed the bridge at all, leaking one bridge
-    # process per run for the full 30-minute idle timeout.
-    @spawned_pids.each do |pid|
-      Process.kill('TERM', pid) # takes the wine wrapper and the .exe with it
-    rescue Errno::ESRCH
-      nil
+  # One dispatcher thread per CONNECTION, on the real thing. Two objects with
+  # callbacks on one client -- the Application and the Workbook, both raising
+  # SheetChange for the same write -- and the promise is that a caller who
+  # shares state between them needs no lock of his own, because the two can
+  # never be inside their blocks at once. A thread per object breaks exactly
+  # that and nothing else: every other event assertion in this file passes
+  # under it.
+  def test_callbacks_on_two_objects_run_on_the_one_dispatcher_thread
+    with_bridge do |client|
+      xl = client.create('Excel.Application')
+      begin
+        xl.Visible = false
+        xl.DisplayAlerts = false
+        book = xl.Workbooks.Add
+
+        fired = Queue.new
+        xl.ole_events.on('SheetChange') { fired << [:application, Thread.current] }
+        book.ole_events.on('SheetChange') { fired << [:workbook, Thread.current] }
+
+        book.Worksheets(1).Range('C3').Value = 7
+
+        seen = {}
+        begin
+          Timeout.timeout(30) do
+            until seen.key?(:application) && seen.key?(:workbook)
+              who, thread = fired.pop
+              seen[who] = thread
+            end
+          end
+        rescue Timeout::Error
+          # A verdict, not an exception escaping: with only one of the two
+          # delivered there is nothing to compare, and saying which one is
+          # missing is the difference between a report and a timeout.
+          flunk "only #{seen.keys.inspect} fired within 30s -- both objects must be delivered to"
+        end
+
+        assert_same seen[:application], seen[:workbook],
+          "both callbacks must run on the connection's ONE dispatcher thread: a thread per " \
+          "object is a data race in every callback that shares state with another object's"
+      ensure
+        quit_bounded(xl)
+      end
     end
-    excel_gone?(timeout: 5)
-    (excel_pids - @pre_existing_excel_pids).each do |pid|
-      Process.kill('TERM', pid)
-    rescue Errno::ESRCH
-      nil
-    end
-    File.delete(@lockfile) if @lockfile && File.exist?(@lockfile)
   end
 end

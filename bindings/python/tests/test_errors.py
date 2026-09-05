@@ -4,7 +4,10 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from wineole.errors import WineOLEError, NotSerializableError, StaleReferenceError, ProtocolError, RemoteError
+from wineole.errors import (
+    WineOLEError, NotSerializableError, StaleReferenceError, ProtocolError, RemoteError,
+    InstanceClosingError,
+)
 
 
 class ErrorsTest(unittest.TestCase):
@@ -18,6 +21,7 @@ class ErrorsTest(unittest.TestCase):
         self.assertTrue(issubclass(StaleReferenceError, WineOLEError))
         self.assertTrue(issubclass(ProtocolError, WineOLEError))
         self.assertTrue(issubclass(RemoteError, WineOLEError))
+        self.assertTrue(issubclass(InstanceClosingError, WineOLEError))
 
 
 if __name__ == '__main__':
